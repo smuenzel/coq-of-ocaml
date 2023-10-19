@@ -816,6 +816,9 @@ let rec of_expression (typ_vars : Name.t Name.Map.t) (e : expression) :
           | Texp_array es ->
               Monad.List.map (of_expression typ_vars) es >>= fun es ->
               error_message (ErrorArray es) NotSupported "Arrays not handled."
+          | Texp_hole ->
+              error_message (Error "hole") SideEffect
+                "Holes not handled."
           | Texp_while _ ->
               error_message (Error "while") SideEffect
                 "While loops not handled."
@@ -861,7 +864,7 @@ let rec of_expression (typ_vars : Name.t Name.Map.t) (e : expression) :
           | Texp_letexception _ ->
               error_message (Error "let_exception") SideEffect
                 "Let of exception is not handled"
-          | Texp_assert e' ->
+          | Texp_assert (e', _) ->
               Type.of_typ_expr false typ_vars e.exp_type >>= fun (typ, _, _) ->
               of_expression typ_vars e' >>= fun e' ->
               error_message
@@ -1073,7 +1076,7 @@ and of_match :
                   return typ
                 else
                   (* Only expand type if you really need to. It may cause the translation to break *)
-                  let typ = Ctype.full_expand c_rhs.exp_env c_rhs.exp_type in
+                  let typ = Ctype.full_expand ~may_forget_scope:false c_rhs.exp_env c_rhs.exp_type in
                   let* typ, _, _ = Type.of_typ_expr true typ_vars typ in
                   return typ
               in
@@ -1256,7 +1259,7 @@ and import_let_fun (typ_vars : Name.t Name.Map.t) (at_top_level : bool)
                   (* Special case for functions whose type is given by a type
                      synonym at the end rather than with a type on each
                      parameter or an explicit arrow type. *)
-                  match (vb_expr.exp_desc, vb_expr.exp_type.desc) with
+                  match (vb_expr.exp_desc, Types.get_desc vb_expr.exp_type) with
                   | Texp_function _, Tconstr (path, _, _) -> (
                       match Env.find_type path vb_expr.exp_env with
                       | { type_manifest = Some ty; _ } -> ty
@@ -1304,24 +1307,33 @@ and import_let_fun (typ_vars : Name.t Name.Map.t) (at_top_level : bool)
 
 and of_let (typ_vars : Name.t Name.Map.t) (is_rec : Asttypes.rec_flag)
     (cases : Typedtree.value_binding list) (e2 : t) : t Monad.t =
-  match cases with
-  | [
-   {
-     vb_pat =
-       {
-         pat_desc =
-           Tpat_construct
-             (_, { cstr_res = { desc = Tconstr (path, _, _); _ }; _ }, _);
-         _;
-       };
-     _;
-   };
-  ]
-    when PathName.is_unit path ->
+  let is_top_level_evaluation =
+    match cases with
+    | [
+      {
+        vb_pat =
+          {
+            pat_desc =
+              Tpat_construct
+                (_, { cstr_res; _}, _, _);
+            _;
+          };
+        _;
+      };
+    ] ->     
+      begin match Types.get_desc cstr_res with
+        | Tconstr (path, _, _) ->
+          PathName.is_unit path
+        | _ -> false
+      end
+    | _ -> false
+  in
+  if is_top_level_evaluation
+  then 
       raise
         (ErrorMessage (e2, "top_level_evaluation"))
         SideEffect "Top-level evaluations are ignored"
-  | _ -> (
+  else (
       (match cases with
       | [ { vb_expr = { exp_desc; exp_type; _ }; _ } ]
         when match exp_desc with Texp_function _ -> false | _ -> true ->
@@ -1419,6 +1431,44 @@ and of_module_expr (typ_vars : Name.t Name.Map.t)
           build_module module_typ_params_arity values module_type_path
             mixed_path_of_value_or_typ
         in
+        let apply_mod e1 e2 =
+          let e1_mod_type = e1.mod_type in
+          let expected_module_typ_for_e2 =
+            match e1_mod_type with
+            | Mty_functor (Named (_, module_typ_arg), _) ->
+              Some module_typ_arg
+            | _ -> None
+          in
+          let* e1 = of_module_expr typ_vars e1 None in
+          let* es =
+            match e1_mod_type with
+            | Mty_functor (Unit, _) -> return []
+            | _ ->
+              match e2 with
+              | None ->
+                raise [] Unexpected
+                  ("Tmod_apply_unit was used with a non-generative functor")
+              | Some e2 ->
+                let* e2 =
+                  of_module_expr typ_vars e2 expected_module_typ_for_e2
+                in
+                return [ Some e2 ]
+          in
+          let application = Apply (e1, es) in
+          match is_module_typ_first_class with
+          | Some (Found module_type_path, module_type) ->
+            let* is_cast_needed = get_is_cast_needed module_type_path in
+            if not is_cast_needed then return application
+            else
+              let ident = Ident.create_local "functor_result" in
+              let* name = Name.of_ident false ident in
+              let path = Path.Pident ident in
+              let* casted_result =
+                cast_path path module_type module_type_path
+              in
+              return (LetVar (None, name, [], application, casted_result))
+          | _ -> return application
+        in
         match mod_desc with
         | Tmod_ident (path, _) -> (
             let* mixed_path = MixedPath.of_path false path in
@@ -1455,38 +1505,13 @@ and of_module_expr (typ_vars : Name.t Name.Map.t)
                 in
                 return (Functor (x, module_typ_arg, e))
             | Unit -> return e)
-        | Tmod_apply (e1, e2, _) -> (
-            let e1_mod_type = e1.mod_type in
-            let expected_module_typ_for_e2 =
-              match e1_mod_type with
-              | Mty_functor (Named (_, module_typ_arg), _) ->
-                  Some module_typ_arg
-              | _ -> None
-            in
-            let* e1 = of_module_expr typ_vars e1 None in
-            let* es =
-              match e1_mod_type with
-              | Mty_functor (Unit, _) -> return []
-              | _ ->
-                  let* e2 =
-                    of_module_expr typ_vars e2 expected_module_typ_for_e2
-                  in
-                  return [ Some e2 ]
-            in
-            let application = Apply (e1, es) in
-            match is_module_typ_first_class with
-            | Some (Found module_type_path, module_type) ->
-                let* is_cast_needed = get_is_cast_needed module_type_path in
-                if not is_cast_needed then return application
-                else
-                  let ident = Ident.create_local "functor_result" in
-                  let* name = Name.of_ident false ident in
-                  let path = Path.Pident ident in
-                  let* casted_result =
-                    cast_path path module_type module_type_path
-                  in
-                  return (LetVar (None, name, [], application, casted_result))
-            | _ -> return application)
+        | Tmod_apply (e1, e2, _) ->
+            apply_mod e1 (Some e2)
+        | Tmod_apply_unit e1 ->
+            apply_mod e1 None
+        | Tmod_hole ->
+          error_message (Error "hole") Module
+            "Holes not handled."
         | Tmod_constraint (module_expr, mod_type, _, _) ->
             let module_type =
               match module_type with

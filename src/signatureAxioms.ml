@@ -191,7 +191,7 @@ let rec of_signature (signature : Typedtree.signature) : t Monad.t =
                    incl_type final_env
                  >>= fun fields ->
                  return (free_vars @ Value (module_name, [], typ) :: fields))
-         | Tsig_modsubst _ ->
+         | Tsig_modsubst _ | Tsig_modtypesubst _ ->
              raise
                [ Error "unhandled_module_substitution" ]
                NotSupported "We do not handle module substitution"
